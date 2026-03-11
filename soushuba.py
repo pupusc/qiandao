@@ -146,9 +146,11 @@ class SouShuBaClient:
             }
             resp = self.session.post(space_url, proxies=self.proxies, data=payload, headers=headers, verify=False)
             if re.search("操作成功", resp.text):
+                logger.info(resp)
                 logger.info(f'{self.username} post {x + 1}nd successfully!')
                 time.sleep(120)
             else:
+                logger.warning(resp)
                 logger.warning(f'{self.username} post {x + 1}nd failed!')
 
 
