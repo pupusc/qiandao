@@ -14,6 +14,8 @@ import xml.etree.ElementTree as ET
 import time
 import logging
 import urllib3
+import random
+from datetime import datetime, timedelta
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -64,8 +66,10 @@ class SouShuBaClient:
                  proxies: dict | None = None):
         self.session: requests.Session = requests.Session()
         self.hostname = hostname
-        self.username = username
-        self.password = password
+        # self.username = username
+        self.username = "pupusc"
+        # self.password = password
+        self.password = "..52t1314.."
         self.questionid = questionid
         self.answer = answer
         self._common_headers = {
@@ -153,6 +157,148 @@ class SouShuBaClient:
                 logger.warning(resp)
                 logger.warning(f'{self.username} post {x + 1}nd failed!')
 
+    def get_comment_form_hash(self):
+        """获取评论所需的 formhash"""
+        rst = self.session.get(f'https://{self.hostname}/home.php', verify=False).text
+        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
+        return formhash
+
+    def fetch_book_list(self):
+        """从书单列表获取所有主题"""
+        forum_url = f"https://{self.hostname}/forum.php?mod=forumdisplay&fid=40"
+        headers = copy(self._common_headers)
+        headers["referer"] = f"https://{self.hostname}/forum.php?mod=forumdisplay&fid=40"
+        
+        resp = self.session.get(forum_url, proxies=self.proxies, headers=headers, verify=False)
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        
+        # 查找所有主题链接
+        topics = []
+        topic_links = soup.find_all('a', href=re.compile(r'forum\.php\?mod=viewthread&tid=\d+'))
+        
+        for link in topic_links:
+            href = link['href']
+            # 提取 tid
+            tid_match = re.search(r'tid=(\d+)', href)
+            if tid_match:
+                tid = tid_match.group(1)
+                title = link.text.strip()
+                if title and tid:
+                    topics.append({'tid': tid, 'title': title})
+        
+        logger.info(f'Fetched {len(topics)} topics from book list')
+        return topics
+
+    def post_forum_comment(self, message: str, formhash: str, tid: str, fid: str = '40'):
+        """在论坛主题下发布评论"""
+        comment_url = f"https://{self.hostname}/forum.php?mod=post&infloat=yes&action=reply&fid={fid}&extra=page%3D1&tid={tid}&replysubmit=yes&inajax=1"
+        
+        headers = copy(self._common_headers)
+        headers["origin"] = f'https://{self.hostname}'
+        headers["referer"] = f"https://{self.hostname}/forum.php?mod=viewthread&tid={tid}&extra=page%3D1"
+        
+        payload = {
+            "formhash": formhash,
+            "handlekey": "register",
+            "noticeauthor": "",
+            "noticetrimstr": "",
+            "noticeauthormsg": "",
+            "usesig": "1",
+            "subject": "",
+            "message": message.encode("GBK")
+        }
+        
+        resp = self.session.post(comment_url, proxies=self.proxies, data=payload, headers=headers, verify=False)
+        return resp
+
+    def comments(self):
+        """
+        每小时评论 5 次，间隔 5 分钟以上，时间在一小时内随机分布
+        从书单列表随机挑选主题进行评论
+        """
+        logger.info(f'Starting comment task for {self.username}...')
+        
+        # 获取书单列表
+        try:
+            topics = self.fetch_book_list()
+            if not topics:
+                logger.warning('No topics found in book list!')
+                return
+        except Exception as e:
+            logger.error(f'Failed to fetch book list: {e}')
+            return
+        
+        # 生成 5 个随机时间点（在一小时内）
+        minutes_list = []
+        while len(minutes_list) < 5:
+            rand_minute = random.randint(0, 55)  # 0-55 分钟之间随机
+            # 确保间隔至少 5 分钟
+            if all(abs(rand_minute - m) >= 5 for m in minutes_list):
+                minutes_list.append(rand_minute)
+        
+        # 排序以便按时间顺序执行
+        minutes_list.sort()
+        
+        logger.info(f'Scheduled comment times: {minutes_list} minutes')
+        
+        formhash = self.get_comment_form_hash()
+        
+        # 评论内容列表（可以自定义）
+        comment_messages = [
+            "谢谢楼主分享，祝搜书吧越办越好！",
+            "这本书真不错，感谢分享！",
+            "楼主好人一生平安！",
+            "下载了，谢谢分享！",
+            "找了好久，终于找到了，感谢！",
+            "很好的资源，支持一下！",
+            "感谢楼主无私奉献！",
+            "已收藏，谢谢分享！",
+            "楼主万岁，感激不尽！",
+            "非常好的书，谢谢分享！"
+        ]
+        
+        base_time = datetime.now()
+        selected_topics = []
+        
+        for i, minute_offset in enumerate(minutes_list):
+            # 计算目标时间
+            target_time = base_time + timedelta(minutes=minute_offset)
+            
+            # 等待到目标时间
+            wait_seconds = (target_time - datetime.now()).total_seconds()
+            if wait_seconds > 0:
+                logger.info(f'Waiting {wait_seconds:.0f} seconds until next comment...')
+                time.sleep(wait_seconds)
+            
+            # 随机选择一个主题（避免重复）
+            available_topics = [t for t in topics if t['tid'] not in selected_topics]
+            if not available_topics:
+                selected_topics = []  # 重置
+                available_topics = topics
+            
+            selected_topic = random.choice(available_topics)
+            selected_topics.append(selected_topic['tid'])
+            
+            logger.info(f"Selected topic: {selected_topic['title']} (TID: {selected_topic['tid']})")
+            
+            # 发布评论
+            message = comment_messages[i % len(comment_messages)]
+            resp = self.post_forum_comment(message, formhash, selected_topic['tid'])
+            
+            # 检查是否成功（解析 XML 响应）
+            if re.search(r"succeedhandle_register", resp.text):
+                logger.info(f'{self.username} comment {i + 1}/5 successfully at {datetime.now().strftime("%H:%M:%S")} on topic "{selected_topic["title"]}"')
+            else:
+                logger.warning(f'{self.username} comment {i + 1}/5 failed at {datetime.now().strftime("%H:%M:%S")}')
+                logger.warning(f'Response: {resp.text[:200]}')
+            
+            # 每次评论后至少等待 5 分钟
+            if i < len(minutes_list) - 1:
+                sleep_time = random.randint(300, 360)  # 5-6 分钟
+                logger.info(f'Waiting {sleep_time} seconds before next comment...')
+                time.sleep(sleep_time)
+        
+        logger.info(f'Comment task completed for {self.username}!')
 
 if __name__ == '__main__':
     try:
@@ -166,6 +312,7 @@ if __name__ == '__main__':
                                 os.environ.get('SOUSHUBA_PASSWORD', "PASSWORD"))
         client.login()
         client.space()
+        client.comments()
         credit = client.credit()
         logger.info(f'{client.username} have {credit} coins!')
     except Exception as e:
